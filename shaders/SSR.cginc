@@ -80,6 +80,8 @@ float3 getBlurredGP(const sampler2D GrabTextureSSR, const float2 TexelSize, cons
  *  by a float4 for a total of 28 operations. However, most of the elements of the camera to projection
  *  matrix are 0's, we don't need the z component for getting screen coordinates, and the w component is
  *  is just the negative of the input's z. Just doing the necessary calculations reduces the operations down to just 7.
+ *	NOTE: this assumes an orthogonal projection matrix, might not work for some headsets (pimax) with non-parallel near/far
+ *  planes
  *
  *  @param pos camera space coordinate to transform
  *  @return float4 containing the x and y projection space coordinates, 0, and the w component for perspective correction
@@ -90,6 +92,29 @@ float4 CameraToScreenPosCheap(const float4 pos)
 	return float4(pos.x * UNITY_MATRIX_P._m00 + pos.z * UNITY_MATRIX_P._m02, pos.y * UNITY_MATRIX_P._m11 + pos.z * UNITY_MATRIX_P._m12, 0, -pos.z);
 }
 
+
+/** @brief Scales SSR step size based on distance and angle such that a step moves the ray by screen height / max iterations in X,Y screenspace
+ *	i.e. the ray can traverse across the screen no matter the direction it is going or position it starts from 
+ *
+ *	@param rayDir Direction of the ray
+ *  @param rayPos Camera space position of the ray
+ *  @param maxIterations The maximum number of steps the SSR can take
+ *  @param minStep The smallest step size allowed
+ *
+ *  @return Step size scaled to move the ray 1/maxIterations of the vertical dimension of the screen
+ */
+float perspectiveScaledStep(float3 rayDir, float3 rayPos, float maxIterations, float minStep)
+{
+	#define TWO_TAN_HALF_FOV 2.0 // 2 * tan(fov/2). I'm not sure how to get the vertical FOV from unity's projection matrix, so assume 90
+
+	// Vector between rayDir and a ray from the camera to the ray's position scaled to have the same z value as raydir. This is essentially the distance in
+	// flat screen coordinates the ray will move
+	float screenLen = length(rayDir.xy - rayPos.xy * (rayDir.z / rayPos.z));
+	// Create scaling factor, which when multiplied by the ray's Z position will give a step size that will move the ray 1/maxIterations of the screen
+	float distScale = TWO_TAN_HALF_FOV / (maxIterations * max(screenLen, 0.05));
+
+	return clamp(distScale * (-rayPos.z), minStep, 30 * minStep);
+}
 
 
 /** @brief March a ray from a given position in a given direction
@@ -159,15 +184,21 @@ float4 reflect_ray(float4 reflectedRay, float4 rayDir, float largeRadius, float 
 	float4 finalPos = float4(0,0,0,1);
 
 	float step_noise = mad(noise, 0.01, 0.05);
+#define tanHalfFOV 1 //I'm not sure how to extract the FOV from the projection matrix, so instead just assume its 90
+	/*
 
-#define tanHalfFOV 1.0 //I'm not sure how to extract the FOV from the projection matrix, so instead just assume its 90
-
-	float distScale = tanHalfFOV / (maxIterations * max(length(rayDir.xy), 0.05));
-	stepSize = max(stepSize, -reflectedRay.z * distScale);
-	smallRadius = (smallRadius/largeRadius)*stepSize;
-	largeRadius = mad(noise,stepSize,stepSize);
-
+	float perspectiveLen = length(rayDir.xy - reflectedRay.xy * (rayDir.z / reflectedRay.z));
+	float distScale = -(tanHalfFOV) / (0.5*maxIterations * max(perspectiveLen, 0.05));
 	
+	float dynStepSize = clamp(distScale * reflectedRay.z, stepSize, 30*stepSize);
+	*/
+	float dynStepSize = perspectiveScaledStep(rayDir.xyz, reflectedRay.xyz, maxIterations, stepSize);
+	//smallRadius *= 1 + noise;
+	smallRadius = (smallRadius/largeRadius)*dynStepSize;
+	smallRadius = mad(noise, smallRadius, smallRadius);
+	largeRadius = mad(noise,dynStepSize,dynStepSize);
+
+	reflectedRay += rayDir * dynStepSize * noise;
 	
 
 	for (float i = 0; i < maxIterations; i++)
@@ -203,43 +234,44 @@ float4 reflect_ray(float4 reflectedRay, float4 rayDir, float largeRadius, float 
 		// If it is, stop raymarching and set the final position. If it is not, decrease
 		// the step size and possibly reverse the ray direction if it went past the small
 		// radius
+		
 		if (depthDifference < largeRadius)
 		{ 
-			if (direction == 1)
+		UNITY_BRANCH if (direction == 1)
+		{
+				 
+			if(sampleDepth > realDepth - smallRadius)
 			{
-					 
-				if(sampleDepth > realDepth - smallRadius)
+				UNITY_BRANCH if(sampleDepth < realDepth + smallRadius)
 				{
-					if(sampleDepth < realDepth + smallRadius)
-						{
-							finalPos = reflectedRay;
-							break;
-						}
-				direction = -1;
-				//stepSize = 0.1*stepSize;
-				stepSize = max(0.5*stepSize, smallRadius);
+					finalPos = reflectedRay;
+					break;
+				}
+			direction = -1;
+			//stepSize = 0.1*stepSize;
+			dynStepSize = max(0.5*dynStepSize, smallRadius);
+			largeRadius = max(0.5 * largeRadius, smallRadius);
+			//stepSizeMult *= 0.5;
+			}
+		}
+		else
+		{
+			if(sampleDepth < realDepth + smallRadius)
+			{
+				
+				UNITY_BRANCH if(sampleDepth > realDepth - smallRadius)
+				{
+					finalPos = reflectedRay;
+					break;
+				}
+				
+				direction = 1;
+				//stepSize = 0.1 * stepSize;
+				dynStepSize = max(0.5 * dynStepSize, smallRadius);
 				largeRadius = max(0.5 * largeRadius, smallRadius);
 				//stepSizeMult *= 0.5;
-				}
 			}
-			else
-			{
-				if(sampleDepth < realDepth + smallRadius)
-				{
-					
-					if(sampleDepth > realDepth - smallRadius)
-					{
-						finalPos = reflectedRay;
-						break;
-					}
-					
-					direction = 1;
-					//stepSize = 0.1 * stepSize;
-					stepSize = max(0.5 * stepSize, smallRadius);
-					largeRadius = max(0.5 * largeRadius, smallRadius);
-					//stepSizeMult *= 0.5;
-				}
-			}
+		}
 			
 			
 		}
@@ -247,16 +279,19 @@ float4 reflect_ray(float4 reflectedRay, float4 rayDir, float largeRadius, float 
 		/*
 		reflectedRay = rayDir*direction*stepSize + reflectedRay;
 		*/
-		reflectedRay = mad(rayDir, direction * stepSize,  reflectedRay);
-		
+		reflectedRay = mad(rayDir, direction * dynStepSize,  reflectedRay);
+
+		float oldStep = dynStepSize;
+		dynStepSize = perspectiveScaledStep(rayDir.xyz, reflectedRay.xyz, maxIterations, stepSize);
+		float stepIncrease = dynStepSize / oldStep;
 		/*
 		 * increase the speed of the ray and search radius as the ray gets farther away with added noise.
 		 * The noise in the search radius helps significantly with banding artifacts
 		 */
 		
-		stepSize = mad(stepSize, step_noise, stepSize);
-		largeRadius = mad(largeRadius, step_noise, largeRadius);
-		smallRadius = mad(smallRadius, step_noise, smallRadius);
+		//stepSize = mad(stepSize, step_noise, stepSize);
+		largeRadius = stepIncrease * largeRadius;
+		smallRadius = stepIncrease * smallRadius;
 
 		
 		//stepSize += stepSize * step_noise;
@@ -362,7 +397,8 @@ float4 getSSRColor(
 	 * do the math to get the smallest amount necessary.
 	 */
 	
-	float4 reflectedRay = wPos + (largeRadius*stepSize/FdotR + noise*stepSize)*rayDir;
+	float4 reflectedRay = wPos + (largeRadius*stepSize/(FdotR + 0.000001))*rayDir;
+	
 	
 	// scatter rays based on roughness. WARNING. CAN BE EXTREMELY EXPENSIVE. RANDOM AND SPREAD OUT TEXTURE SAMPLES ARE VERY INEFFCIENT
 	// YOU MAY WANT TO REMOVE THIS.
@@ -397,9 +433,6 @@ float4 getSSRColor(
 		 */
 		int back = 1;
 		
-		
-		
-		
 		/*
 		 * Do the raymarching against the depth texture. This returns a world-space position where the ray hit the depth texture,
 		 * along with the number of iterations it took stored as the w component.
@@ -429,10 +462,7 @@ float4 getSSRColor(
 		uvs = UNITY_PROJ_COORD(ComputeGrabScreenPos(CameraToScreenPosCheap(finalPos)));
 		uvs.xy = uvs.xy / uvs.w;
 					
-		
-	
-	
-	
+
 		/*
 		 * Fade towards the edges of the screen. If we're in VR, we can't really
 		 * fade horizontally all that well as that results in stereo mismatch (the
