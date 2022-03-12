@@ -22,8 +22,9 @@ Include these properties in your shader to control the SSR's behavior
 		_edgeFade("Edge Fade", Range(0,1)) = 0.1
 */ 
 
-sampler2D_float _CameraDepthTexture;
+#include "ScreenspaceMacros.cginc"
 
+UNITY_DECLARE_DEPTH_TEXTURE(_CameraDepthTexture);
 
 
 /** @brief Check to see if the camera rendering the pixel is a mirror camera.
@@ -56,7 +57,7 @@ bool IsInMirror()
  * @param uvs Uv coordinate of the pixel on grabpass.
  * @param dim Width/height of the square of pixels to sample around uvs
  */
-float3 getBlurredGP(const sampler2D GrabTextureSSR, const float2 TexelSize, const float2 uvs, const float dim)
+float3 getBlurredGP(PARAM_SCREENSPACE_TEXTURE(GrabTextureSSR), const float2 TexelSize, const float2 uvs, const float dim)
 {
 	float2 pixSize = 2/TexelSize;
 	float center = floor(dim*0.5);
@@ -65,7 +66,7 @@ float3 getBlurredGP(const sampler2D GrabTextureSSR, const float2 TexelSize, cons
 	{
 		for (int j = 0; j < floor(dim); j++)
 		{
-			float4 refl = tex2Dlod(GrabTextureSSR, float4(uvs.x + pixSize.x*(i-center), uvs.y + pixSize.y*(j-center),0,0));
+			float4 refl = SAMPLE_SCREENSPACE_TEXTURE_LOD(GrabTextureSSR, float4(uvs.x + pixSize.x*(i-center), uvs.y + pixSize.y*(j-center),0,0));
 			refTotal += refl.rgb;
 		}
 	}
@@ -220,7 +221,7 @@ float4 reflect_ray(float4 reflectedRay, float4 rayDir, float largeRadius, float 
 		}
 
 
-		float rawDepth = DecodeFloatRG(tex2Dlod(_CameraDepthTexture,float4(uvDepth,0,0)));
+		float rawDepth = DecodeFloatRG(SAMPLE_DEPTH_TEXTURE_LOD(_CameraDepthTexture,float4(uvDepth,0,0)));
 		float linearDepth = Linear01Depth(rawDepth);
 		
 
@@ -348,7 +349,7 @@ float4 getSSRColor(
 					float smoothness,
 					const float edgeFade,
 					const float2 scrnParams,
-					const sampler2D GrabTextureSSR,
+					PARAM_SCREENSPACE_TEXTURE(GrabTextureSSR),
 					const Texture2D NoiseTex,
 					const float2 NoiseTex_dim,
 					float4 albedo,
@@ -491,7 +492,7 @@ float4 getSSRColor(
 		 * occurs at 0.5 smoothness.
 		 */
 		float blurFactor = max(1,min(blur, blur * (-2)*(smoothness-1)));
-		float4 reflection = float4(getBlurredGP(GrabTextureSSR, scrnParams, uvs.xy, blurFactor),1);
+		float4 reflection = float4(getBlurredGP(PASS_SCREENSPACE_TEXTURE(GrabTextureSSR), scrnParams, uvs.xy, blurFactor),1);
 		
 		reflection.a *= smoothness*reflStr*fade;
 		
