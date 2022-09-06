@@ -22,7 +22,28 @@ Include these properties in your shader to control the SSR's behavior
 		_edgeFade("Edge Fade", Range(0,1)) = 0.1
 */ 
 
-sampler2D_float _CameraDepthTexture;
+#include "ScreenspaceMacros.cginc"
+
+struct SSRInput
+{
+	float4 wPos;
+	float3 viewDir;
+	float4 rayDir;
+	float3 faceNormal;
+	float hitRadius;
+	float blur;
+	int maxSteps;
+	float smoothness;
+	float edgeFade;
+	float2 scrnParams;
+	SSR_DECLARE_SCREENSPACE_TEX(GrabTextureSSR)
+	Texture2D NoiseTex;
+	float2 NoiseTex_dim;
+};
+
+UNITY_DECLARE_DEPTH_TEXTURE(_CameraDepthTexture);
+//SamplerState sampler_CameraDepthTexture;
+//Texture2D<float> _CameraDepthTexture;
 
 
 
@@ -56,7 +77,7 @@ bool IsInMirror()
  * @param uvs Uv coordinate of the pixel on grabpass.
  * @param dim Width/height of the square of pixels to sample around uvs
  */
-float3 getBlurredGP(const sampler2D GrabTextureSSR, const float2 TexelSize, const float2 uvs, const float dim)
+float3 getBlurredGP(PARAM_SCREENSPACE_TEXTURE(GrabTextureSSR), const float2 TexelSize, const float2 uvs, const float dim)
 {
 	float2 pixSize = 2/TexelSize;
 	float center = floor(dim*0.5);
@@ -65,7 +86,7 @@ float3 getBlurredGP(const sampler2D GrabTextureSSR, const float2 TexelSize, cons
 	{
 		for (int j = 0; j < floor(dim); j++)
 		{
-			float4 refl = tex2Dlod(GrabTextureSSR, float4(uvs.x + pixSize.x*(i-center), uvs.y + pixSize.y*(j-center),0,0));
+			float4 refl = SAMPLE_SCREENSPACE_TEXTURE_LOD(GrabTextureSSR, float4(uvs.x + pixSize.x*(i-center), uvs.y + pixSize.y*(j-center),0,0));
 			refTotal += refl.rgb;
 		}
 	}
@@ -80,16 +101,41 @@ float3 getBlurredGP(const sampler2D GrabTextureSSR, const float2 TexelSize, cons
  *  by a float4 for a total of 28 operations. However, most of the elements of the camera to projection
  *  matrix are 0's, we don't need the z component for getting screen coordinates, and the w component is
  *  is just the negative of the input's z. Just doing the necessary calculations reduces the operations down to just 7.
+ *	NOTE: this assumes an orthogonal projection matrix, might not work for some headsets (pimax) with non-parallel near/far
+ *  planes
  *
  *  @param pos camera space coordinate to transform
  *  @return float4 containing the x and y projection space coordinates, 0, and the w component for perspective correction
  */
 
-float4 CameraToScreenPosCheap(const float4 pos)
+float4 CameraToScreenPosCheap(const float3 pos)
 {
 	return float4(pos.x * UNITY_MATRIX_P._m00 + pos.z * UNITY_MATRIX_P._m02, pos.y * UNITY_MATRIX_P._m11 + pos.z * UNITY_MATRIX_P._m12, 0, -pos.z);
 }
 
+
+/** @brief Scales SSR step size based on distance and angle such that a step moves the ray by screen height / max iterations in X,Y screenspace
+ *	i.e. the ray can traverse across the screen no matter the direction it is going or position it starts from 
+ *
+ *	@param rayDir Direction of the ray
+ *  @param rayPos Camera space position of the ray
+ *  @param maxIterations The maximum number of steps the SSR can take
+ *  @param minStep The smallest step size allowed
+ *
+ *  @return Step size scaled to move the ray 1/maxIterations of the vertical dimension of the screen
+ */
+float perspectiveScaledStep(float3 rayDir, float3 rayPos, float maxIterations)
+{
+	//#define TWO_TAN_HALF_FOV 2 // 2 / cot(fov/2). I'm not sure how to get the vertical FOV from unity's projection matrix, so assume 90
+	float TWO_TAN_HALF_FOV = (-2.0 / UNITY_MATRIX_P._m11);
+	// Vector between rayDir and a ray from the camera to the ray's position scaled to have the same z value as raydir. This is essentially the distance in
+	// flat screen coordinates the ray will move
+	float screenLen = length(rayDir.xy - rayPos.xy * (rayDir.z / rayPos.z));
+	// Create scaling factor, which when multiplied by the ray's Z position will give a step size that will move the ray 1/maxIterations of the screen
+	float distScale = TWO_TAN_HALF_FOV / (maxIterations * max(screenLen, 0.05));
+	distScale = min(distScale, _ProjectionParams.z / maxIterations);
+	return max(distScale * (-rayPos.z), 0.01);
+}
 
 
 /** @brief March a ray from a given position in a given direction
@@ -125,7 +171,7 @@ float4 CameraToScreenPosCheap(const float4 pos)
  *          it took stored in the w component. If the function ran out of
  *          iterations or the ray went off screen, the xyz will be (0,0,0).
  */
-float4 reflect_ray(float4 reflectedRay, float4 rayDir, float largeRadius, float smallRadius, float stepSize, float noise, const float maxIterations)
+float4 reflect_ray(float3 reflectedRay, float3 rayDir, float hitRadius, float noise, float FdotR, const float maxIterations)
 {
 	/* 
      *  If we are in VR, we have effectively two screens side by side in a single texture. We want to stop the ray if it goes off screen. The problem is, we can't simply look at
@@ -145,8 +191,8 @@ float4 reflect_ray(float4 reflectedRay, float4 rayDir, float largeRadius, float 
 	//static const float4x4 worldToDepth = //mul(UNITY_MATRIX_MV, unity_WorldToObject);
 	
 	reflectedRay = mul(UNITY_MATRIX_V, float4(reflectedRay.xyz, 1));
-	rayDir = mul(UNITY_MATRIX_V, float4(rayDir.xyz, 0));
-	rayDir.xyz = normalize(rayDir.xyz);
+	rayDir = mul((float3x3)UNITY_MATRIX_V, rayDir.xyz);
+	//rayDir.xyz = normalize(rayDir.xyz);
 	
 	float totalIterations = 0;//For tracking how far this ray has gone for fading out later
 	
@@ -159,15 +205,21 @@ float4 reflect_ray(float4 reflectedRay, float4 rayDir, float largeRadius, float 
 	float4 finalPos = float4(0,0,0,1);
 
 	float step_noise = mad(noise, 0.01, 0.05);
+#define tanHalfFOV 1 //I'm not sure how to extract the FOV from the projection matrix, so instead just assume its 90
+	/*
 
-#define tanHalfFOV 1.0 //I'm not sure how to extract the FOV from the projection matrix, so instead just assume its 90
-
-	float distScale = tanHalfFOV / (maxIterations * max(length(rayDir.xy), 0.05));
-	stepSize = max(stepSize, -reflectedRay.z * distScale);
-	smallRadius = (smallRadius/largeRadius)*stepSize;
-	largeRadius = mad(noise,stepSize,stepSize);
-
+	float perspectiveLen = length(rayDir.xy - reflectedRay.xy * (rayDir.z / reflectedRay.z));
+	float distScale = -(tanHalfFOV) / (0.5*maxIterations * max(perspectiveLen, 0.05));
 	
+	float dynStepSize = clamp(distScale * reflectedRay.z, stepSize, 30*stepSize);
+	*/
+	float dynStepSize = perspectiveScaledStep(rayDir.xyz, reflectedRay.xyz, maxIterations);
+	//smallRadius *= 1 + noise;
+	//smallRadius = hitRadius*dynStepSize;
+	float smallRadius = mad(noise, hitRadius, hitRadius);
+	float largeRadius = mad(noise,2.0*dynStepSize,dynStepSize);
+
+	reflectedRay += rayDir * largeRadius;
 	
 
 	for (float i = 0; i < maxIterations; i++)
@@ -183,63 +235,65 @@ float4 reflect_ray(float4 reflectedRay, float4 rayDir, float largeRadius, float 
 		float2 uvDepth = spos.xy / spos.w;
 
 		//If the ray is outside of the eye's view frustrum, we can stop there's no relevant information here
-		if (uvDepth.x > x_max || uvDepth.x < x_min || uvDepth.y > 1 || uvDepth.y < 0)
+		if (uvDepth.x > x_max || uvDepth.x < x_min || uvDepth.y > 1 || uvDepth.y < 0 || -reflectedRay.z > _ProjectionParams.z)
 		{
+
 			break;
 		}
 
 
-		float rawDepth = DecodeFloatRG(tex2Dlod(_CameraDepthTexture,float4(uvDepth,0,0)));
+		float rawDepth = DecodeFloatRG(SAMPLE_SCREENSPACE_TEXTURE_LOD(_CameraDepthTexture,float4(uvDepth,0,0)));
 		float linearDepth = Linear01Depth(rawDepth);
-		
+		linearDepth = linearDepth > 0.999999 ? 2000 : linearDepth;
 
 		//float sampleDepth = -mul(worldToDepth, float4(reflectedRay.xyz, 1)).z;
 		float sampleDepth = -reflectedRay.z;
 		float realDepth = linearDepth * _ProjectionParams.z;
 
-		float depthDifference = abs(sampleDepth) - abs(realDepth);
+		float depthDifference = abs(sampleDepth - realDepth);
 
 		// If the ray is within the large radius, check if it is within the small radius.
 		// If it is, stop raymarching and set the final position. If it is not, decrease
 		// the step size and possibly reverse the ray direction if it went past the small
 		// radius
+		
 		if (depthDifference < largeRadius)
 		{ 
-			if (direction == 1)
+		UNITY_BRANCH if (direction == 1)
+		{
+				 
+			if(sampleDepth > realDepth - smallRadius)
 			{
-					 
-				if(sampleDepth > realDepth - smallRadius)
+				UNITY_BRANCH if(sampleDepth < realDepth + smallRadius)
 				{
-					if(sampleDepth < realDepth + smallRadius)
-						{
-							finalPos = reflectedRay;
-							break;
-						}
-				direction = -1;
-				//stepSize = 0.1*stepSize;
-				stepSize = max(0.5*stepSize, smallRadius);
+					finalPos.xyz = reflectedRay;
+					break;
+				}
+			direction = -1;
+			//stepSize = 0.1*stepSize;
+			dynStepSize = 0.5 * dynStepSize;
+			largeRadius = max(0.5 * largeRadius, smallRadius);
+			//stepSizeMult *= 0.5;
+			}
+		}
+		else
+		{
+			if(sampleDepth < realDepth + smallRadius)
+			{
+				
+				UNITY_BRANCH if(sampleDepth > realDepth - smallRadius)
+				{
+					finalPos.xyz = reflectedRay;
+					break;
+				}
+				
+				direction = 1;
+				//stepSize = 0.1 * stepSize;
+				dynStepSize = 0.5 * dynStepSize;
 				largeRadius = max(0.5 * largeRadius, smallRadius);
 				//stepSizeMult *= 0.5;
-				}
 			}
-			else
-			{
-				if(sampleDepth < realDepth + smallRadius)
-				{
-					
-					if(sampleDepth > realDepth - smallRadius)
-					{
-						finalPos = reflectedRay;
-						break;
-					}
-					
-					direction = 1;
-					//stepSize = 0.1 * stepSize;
-					stepSize = max(0.5 * stepSize, smallRadius);
-					largeRadius = max(0.5 * largeRadius, smallRadius);
-					//stepSizeMult *= 0.5;
-				}
-			}
+		}
 			
 			
 		}
@@ -247,16 +301,19 @@ float4 reflect_ray(float4 reflectedRay, float4 rayDir, float largeRadius, float 
 		/*
 		reflectedRay = rayDir*direction*stepSize + reflectedRay;
 		*/
-		reflectedRay = mad(rayDir, direction * stepSize,  reflectedRay);
-		
+		reflectedRay = mad(rayDir, direction * dynStepSize,  reflectedRay);
+
+		float oldStep = dynStepSize;
+		dynStepSize = perspectiveScaledStep(rayDir.xyz, reflectedRay.xyz, maxIterations);
+		float stepIncrease = dynStepSize / oldStep;
 		/*
 		 * increase the speed of the ray and search radius as the ray gets farther away with added noise.
 		 * The noise in the search radius helps significantly with banding artifacts
 		 */
 		
-		stepSize = mad(stepSize, step_noise, stepSize);
-		largeRadius = mad(largeRadius, step_noise, largeRadius);
-		smallRadius = mad(smallRadius, step_noise, smallRadius);
+		//stepSize = mad(stepSize, step_noise, stepSize);
+		largeRadius = stepIncrease * largeRadius;
+		smallRadius = stepIncrease * smallRadius;
 
 		
 		//stepSize += stepSize * step_noise;
@@ -299,46 +356,18 @@ float4 reflect_ray(float4 reflectedRay, float4 rayDir, float largeRadius, float 
  *  @param reflStr		Multiplier for how intense the SSR should be
  */
 
-float4 getSSRColor(
-					const float4 wPos,
-					const float3 viewDir,
-					float4 rayDir,
-					const half3 faceNormal,
-					float largeRadius,
-					float smallRadius,
-					float stepSize,
-					float blur,
-					const int maxSteps,
-					const int isLowRes,
-					float smoothness,
-					const float edgeFade,
-					const float2 scrnParams,
-					const sampler2D GrabTextureSSR,
-					const Texture2D NoiseTex,
-					const float2 NoiseTex_dim,
-					float4 albedo,
-					float metallic,
-					float rtint,
-					float mask,
-					float reflStr
-					)
+float4 getSSRColor(SSRInput data)
 {
-	
-	/*
-	 * Calculate the cos of the angle between the view direction of the pixel and the reflected ray
-	 * We'll use this later to skip raymarching if the reflected ray is coming back towards the camera
-	 */
-	float RdotV = dot(rayDir.xyz, viewDir);
 	
 	/*
 	 * Calculate the cos of the angle between the surface (ignoring normal maps) and the reflected ray.
 	 * We'll use this later to make sure the normal from the normal map didn't make us reflect a ray
 	 * whose direction goes underneath the face it's reflecting off of.
 	 */
-	float FdotR = dot(faceNormal, rayDir.xyz);
+	float FdotR = saturate(dot(data.faceNormal, data.rayDir.xyz));
 
 
-	float4 screenUVs = UNITY_PROJ_COORD(ComputeGrabScreenPos(mul(UNITY_MATRIX_VP, wPos)));
+	float4 screenUVs = UNITY_PROJ_COORD(ComputeGrabScreenPos(mul(UNITY_MATRIX_VP, data.wPos)));
 	screenUVs.xy = screenUVs.xy / screenUVs.w;
 
 	/*
@@ -346,139 +375,80 @@ float4 getSSRColor(
 	 * hit detection range to hide repeating artifacts like banding due to the step size
 	 */
 	float4 noiseUvs = screenUVs;// UNITY_PROJ_COORD(ComputeGrabScreenPos(mul(UNITY_MATRIX_VP, wPos)));
-	noiseUvs.xy = noiseUvs.xy * scrnParams;
-	noiseUvs.xy += frac(_Time[1]) * scrnParams;
-	noiseUvs.xy = fmod(noiseUvs.xy, NoiseTex_dim);
+	noiseUvs.xy = noiseUvs.xy * data.scrnParams;
+	noiseUvs.xy += frac(_Time[1]) * data.scrnParams;
+	noiseUvs.xy = fmod(noiseUvs.xy, data.NoiseTex_dim);
 	//noiseUvs.xy = noiseUvs.xy/((scrnParams*NoiseTex_dim) * noiseUvs.w);	
-	float4 noiseRGBA = NoiseTex.Load(float4(noiseUvs.xy,0,0));
+	float4 noiseRGBA = data.NoiseTex.Load(float4(noiseUvs.xy,0,0));
 	float noise = noiseRGBA.r;
 	
-
+	float3 reflectedRay = data.wPos;
+	
+	
+	float4 finalPos = reflect_ray(reflectedRay, data.rayDir, data.hitRadius, noise, FdotR, data.maxSteps);
+	
+	
+	// get the total number of iterations out of finalPos's w component and replace with 1.
+	float totalSteps = finalPos.w;
+	finalPos.w = 1;
 	
 	/*
-	 * Initially move the reflected ray forward a step. We need to move the ray forward enough that
-	 * the ray will not hit the reflected surface's depth before it has a chance to move.
-	 * This is an overestimate of how far the ray needs to move. Could be better, but I'm too lazy to
-	 * do the math to get the smallest amount necessary.
+	 * A position of 0, 0, 0 signifies that the ray went off screen or ran
+	 * out of iterations before actually hitting anything.
 	 */
-	
-	float4 reflectedRay = wPos + (largeRadius*stepSize/FdotR + noise*stepSize)*rayDir;
-	
-	// scatter rays based on roughness. WARNING. CAN BE EXTREMELY EXPENSIVE. RANDOM AND SPREAD OUT TEXTURE SAMPLES ARE VERY INEFFCIENT
-	// YOU MAY WANT TO REMOVE THIS.
-	/*
-	float scatterMult = 0.2;
-	float4 scatter = float4(0.5 - noiseRGBA.rgb,0);
-	rayDir = normalize(rayDir + scatterMult*scatter*(1-smoothness)*sqrt(FdotR));
-	*/
-
-	/*
-	 * Don't raymarch if the ray is coming back towards the camera (RdotV < 0) or
-	 * the ray is going into the surface (FdotR < 0).
-	 * EDIT: don't do the RdotV check, rays coming back towards the camera can be useful
-	 * in some cases
-	 */
-	UNITY_BRANCH
-	if (FdotR < 0)	//else if (FdotR < 0 || RdotV < 0)
+	if (finalPos.x == 0 && finalPos.y == 0 && finalPos.z == 0) 
 	{
 		return float4(0,0,0,0);
 	}
-	else
-	{
+	
+	/*
+	 * Get the screen space coordinates of the ray's final position
+	 */
+	float4 uvs;			
+	//uvs = UNITY_PROJ_COORD(ComputeGrabScreenPos(mul(UNITY_MATRIX_P, finalPos)));
+	uvs = UNITY_PROJ_COORD(ComputeGrabScreenPos(CameraToScreenPosCheap(finalPos)));
+	uvs.xy = uvs.xy / uvs.w;
+				
 
 	/*
-	 * Begin the actual raymarching process
+	 * Fade towards the edges of the screen. If we're in VR, we can't really
+	 * fade horizontally all that well as that results in stereo mismatch (the
+	 * reflection will begin to fade in different locations in each eye). Thus
+	 * just don't fade on X in VR. This isn't really a problem as we have tons
+	 * of screen real estate that is not within the FOV of the headset and thus
+	 * we can actually reflect some stuff that is technically off-screen.
 	 */
-
-		
-		/*
-		 * Controls whether the ray is progressing forward or back along the ray
-		 * path. Set to 1, the ray goes forward. Set to -1, the ray goes back.
-		 */
-		int back = 1;
-		
-		
-		
-		
-		/*
-		 * Do the raymarching against the depth texture. This returns a world-space position where the ray hit the depth texture,
-		 * along with the number of iterations it took stored as the w component.
-		 */
-		
-		float4 finalPos = reflect_ray(reflectedRay, rayDir, largeRadius, smallRadius, stepSize, noise, maxSteps);
-		
-		
-		// get the total number of iterations out of finalPos's w component and replace with 1.
-		float totalSteps = finalPos.w;
-		finalPos.w = 1;
-		
-		/*
-		 * A position of 0, 0, 0 signifies that the ray went off screen or ran
-		 * out of iterations before actually hitting anything.
-		 */
-		if (finalPos.x == 0 && finalPos.y == 0 && finalPos.z == 0) 
-		{
-			return float4(0,0,0,0);
-		}
-		
-		/*
-		 * Get the screen space coordinates of the ray's final position
-		 */
-		float4 uvs;			
-		//uvs = UNITY_PROJ_COORD(ComputeGrabScreenPos(mul(UNITY_MATRIX_P, finalPos)));
-		uvs = UNITY_PROJ_COORD(ComputeGrabScreenPos(CameraToScreenPosCheap(finalPos)));
-		uvs.xy = uvs.xy / uvs.w;
-					
-		
 	
+	#if UNITY_SINGLE_PASS_STEREO
+	float xfade = 1;
+	#else
+	float xfade = smoothstep(0, data.edgeFade, uvs.x)*smoothstep(1, 1 - data.edgeFade, uvs.x);//Fade x uvs out towards the edges
+	#endif
+	float yfade = smoothstep(0, data.edgeFade, uvs.y)*smoothstep(1, 1 - data.edgeFade, uvs.y);//Same for y
+	xfade = pow(xfade, 0.25);
+	yfade = pow(yfade, 0.25);
+	//float lengthFade = smoothstep(1, 0, 2*(totalSteps / data.maxSteps)-1);
 	
+	float fade = xfade * yfade;
 	
-		/*
-		 * Fade towards the edges of the screen. If we're in VR, we can't really
-		 * fade horizontally all that well as that results in stereo mismatch (the
-		 * reflection will begin to fade in different locations in each eye). Thus
-		 * just don't fade on X in VR. This isn't really a problem as we have tons
-		 * of screen real estate that is not within the FOV of the headset and thus
-		 * we can actually reflect some stuff that is technically off-screen.
-		 */
+	/*
+	 * Get the color of the grabpass at the ray's screen uv location, applying
+	 * an (expensive) blur effect to partially simulate roughness
+	 * Second input for getBlurredGP is some math to make it so the max blurring
+	 * occurs at 0.5 smoothness.
+	 */
+	float blurFactor = max(1,min(data.blur, data.blur * (-2)*(data.smoothness-1)));
+	float4 reflection = float4(getBlurredGP(SSR_PASS_SCREENSPACE_TEX(data, GrabTextureSSR), data.scrnParams, uvs.xy, blurFactor),1);
 		
-		#if UNITY_SINGLE_PASS_STEREO
-		float xfade = 1;
-		#else
-		float xfade = smoothstep(0, edgeFade, uvs.x)*smoothstep(1, 1-edgeFade, uvs.x);//Fade x uvs out towards the edges
-		#endif
-		float yfade = smoothstep(0, edgeFade, uvs.y)*smoothstep(1, 1-edgeFade, uvs.y);//Same for y
-		xfade = pow(xfade, 0.25);
-		yfade = pow(yfade, 0.25);
-		float lengthFade = smoothstep(1, 0, 2*(totalSteps / maxSteps)-1);
-	
-		float fade = xfade * yfade;
-	
-		/*
-		 * Get the color of the grabpass at the ray's screen uv location, applying
-		 * an (expensive) blur effect to partially simulate roughness
-		 * Second input for getBlurredGP is some math to make it so the max blurring
-		 * occurs at 0.5 smoothness.
-		 */
-		float blurFactor = max(1,min(blur, blur * (-2)*(smoothness-1)));
-		float4 reflection = float4(getBlurredGP(GrabTextureSSR, scrnParams, uvs.xy, blurFactor),1);
+	/*
+	 * If you're alpha-blending the reflection, then multiplying the alpha by the reflection
+	 * strength and fade is enough. If you're adding the reflection, then you'll need to
+	 * also multiply the color by those terms.
+	 */
+	//reflection.rgb = lerp(reflection.rgb, reflection.rgb*albedo.rgb,  rtint*metallic);
+	//reflection.rgb = lerp(reflection.rgb, reflection.rgb*albedo.rgb,  rtint*metallic)*reflStr*fade;
+	reflection.a = lerp(0, reflection.a, fade*fade*fade);
 		
-		reflection.a *= smoothness*reflStr*fade;
-		
-		
-		/*
-		 * If you're alpha-blending the reflection, then multiplying the alpha by the reflection
-		 * strength and fade is enough. If you're adding the reflection, then you'll need to
-		 * also multiply the color by those terms.
-		 */
-		//reflection.rgb = lerp(reflection.rgb, reflection.rgb*albedo.rgb,  rtint*metallic);
-		reflection.rgb = lerp(reflection.rgb, reflection.rgb*albedo.rgb,  rtint*metallic)*reflStr*fade;
-	
-		
-		
-		reflection.a = lerp(0, reflection.a, fade)*mask;
-			
-		return max(0,reflection); //sqrt(1 - saturate(uvs.y)));
-	}	
+	return max(0,reflection);
 }
 
