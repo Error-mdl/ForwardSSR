@@ -257,45 +257,39 @@ float4 reflect_ray(float3 reflectedRay, float3 rayDir, float hitRadius, float no
 		// the step size and possibly reverse the ray direction if it went past the small
 		// radius
 		
-		if (depthDifference < largeRadius)
-		{ 
-		UNITY_BRANCH if (direction == 1)
+		if (direction == 1)
 		{
-				 
-			if(sampleDepth > realDepth - smallRadius)
+			if (depthDifference < largeRadius && sampleDepth > realDepth)
 			{
-				UNITY_BRANCH if(sampleDepth < realDepth + smallRadius)
+				if (sampleDepth < realDepth + smallRadius)
 				{
 					finalPos.xyz = reflectedRay;
 					break;
 				}
-			direction = -1;
-			//stepSize = 0.1*stepSize;
-			dynStepSize = 0.5 * dynStepSize;
-			largeRadius = max(0.5 * largeRadius, smallRadius);
-			//stepSizeMult *= 0.5;
-			}
-		}
-		else
-		{
-			if(sampleDepth < realDepth + smallRadius)
-			{
-				
-				UNITY_BRANCH if(sampleDepth > realDepth - smallRadius)
-				{
-					finalPos.xyz = reflectedRay;
-					break;
-				}
-				
-				direction = 1;
-				//stepSize = 0.1 * stepSize;
-				dynStepSize = 0.5 * dynStepSize;
+				direction = -1;
+				//stepSize = 0.1*stepSize;
+				dynStepSize = max(0.5 * dynStepSize, smallRadius);
 				largeRadius = max(0.5 * largeRadius, smallRadius);
 				//stepSizeMult *= 0.5;
 			}
 		}
-			
-			
+		else
+		{
+			if (sampleDepth < realDepth + smallRadius)
+			{
+
+				if (sampleDepth > realDepth - smallRadius)
+				{
+					finalPos.xyz = reflectedRay;
+					break;
+				}
+
+				direction = 1;
+				//stepSize = 0.1 * stepSize;
+				dynStepSize = max(0.5 * dynStepSize, smallRadius);
+				largeRadius = max(0.5 * largeRadius, smallRadius);
+				//stepSizeMult *= 0.5;
+			}
 		}
 		
 		/*
