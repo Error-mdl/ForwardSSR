@@ -23,6 +23,8 @@ Include these properties in your shader to control the SSR's behavior
 */ 
 
 #include "ScreenspaceMacros.cginc"
+#include "Packages/com.error.birptourp/ShaderLibrary/Core.hlsl"
+#include "Packages/com.error.birptourp/ShaderLibrary/DeclareDepthTexture.hlsl"
 
 struct SSRInput
 {
@@ -36,12 +38,13 @@ struct SSRInput
 	float smoothness;
 	float edgeFade;
 	float2 scrnParams;
-	SSR_DECLARE_SCREENSPACE_TEX(GrabTextureSSR)
+	TEXTURE2D_X(GrabTextureSSR);
+	SAMPLER(samplerGrabTextureSSR);
 	Texture2D NoiseTex;
 	float2 NoiseTex_dim;
 };
 
-UNITY_DECLARE_DEPTH_TEXTURE(_CameraDepthTexture);
+
 //SamplerState sampler_CameraDepthTexture;
 //Texture2D<float> _CameraDepthTexture;
 
@@ -77,7 +80,7 @@ bool IsInMirror()
  * @param uvs Uv coordinate of the pixel on grabpass.
  * @param dim Width/height of the square of pixels to sample around uvs
  */
-float3 getBlurredGP(PARAM_SCREENSPACE_TEXTURE(GrabTextureSSR), const float2 TexelSize, const float2 uvs, const float dim)
+float3 getBlurredGP(PARAM_TEXTURE2D_X(GrabTextureSSR), const float2 TexelSize, const float2 uvs, const float dim)
 {
 	float2 pixSize = 2/TexelSize;
 	float center = floor(dim*0.5);
@@ -86,7 +89,7 @@ float3 getBlurredGP(PARAM_SCREENSPACE_TEXTURE(GrabTextureSSR), const float2 Texe
 	{
 		for (int j = 0; j < floor(dim); j++)
 		{
-			float4 refl = SAMPLE_SCREENSPACE_TEXTURE_LOD(GrabTextureSSR, float4(uvs.x + pixSize.x*(i-center), uvs.y + pixSize.y*(j-center),0,0));
+			float4 refl = SAMPLE_TEXTURE2D_X_LOD(GrabTextureSSR, samplerGrabTextureSSR, float2(uvs.x + pixSize.x*(i-center), uvs.y + pixSize.y*(j-center)), 0);
 			refTotal += refl.rgb;
 		}
 	}
@@ -242,7 +245,7 @@ float4 reflect_ray(float3 reflectedRay, float3 rayDir, float hitRadius, float no
 		}
 
 
-		float rawDepth = DecodeFloatRG(SAMPLE_SCREENSPACE_TEXTURE_LOD(_CameraDepthTexture,float4(uvDepth,0,0)));
+		float rawDepth = SAMPLE_TEXTURE2D_X_LOD(_CameraDepthTexture, sampler_CameraDepthTexture, uvDepth, 0).r;
 		float linearDepth = Linear01Depth(rawDepth);
 		linearDepth = linearDepth > 0.999999 ? 2000 : linearDepth;
 
@@ -432,7 +435,7 @@ float4 getSSRColor(SSRInput data)
 	 * occurs at 0.5 smoothness.
 	 */
 	float blurFactor = max(1,min(data.blur, data.blur * (-2)*(data.smoothness-1)));
-	float4 reflection = float4(getBlurredGP(SSR_PASS_SCREENSPACE_TEX(data, GrabTextureSSR), data.scrnParams, uvs.xy, blurFactor),1);
+	float4 reflection = float4(getBlurredGP(INPUT_TEXTURE2D_X_STRUCT(data, GrabTextureSSR), data.scrnParams, uvs.xy, blurFactor),1);
 		
 	/*
 	 * If you're alpha-blending the reflection, then multiplying the alpha by the reflection

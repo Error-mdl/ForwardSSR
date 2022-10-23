@@ -153,6 +153,9 @@
 #define INV_FOUR_PI     0.07957747155
 #define HALF_PI         1.57079632679
 #define INV_HALF_PI     0.636619772367
+#define LOG2_E      1.44269504088896340736
+#define INV_SQRT2   0.70710678118654752440
+#define PI_DIV_FOUR 0.78539816339744830961
 
 #define FLT_EPSILON     1.192092896e-07 // Smallest positive number, such that 1.0 + FLT_EPSILON != 1.0
 #define FLT_MIN         1.175494351e-38 // Minimum representable positive floating-point number
